@@ -1,124 +1,225 @@
-class VQA(data.Dataset):
-    """ VQA dataset, open-ended """
-    def __init__(self, questions_path, answers_path, image_features_path, answerable_only=False):
-        super(VQA, self).__init__()
-        with open(questions_path, 'r') as fd:
-            questions_json = json.load(fd)
-        with open(answers_path, 'r') as fd:
-            answers_json = json.load(fd)
-        with open(config.vocabulary_path, 'r') as fd:
-            vocab_json = json.load(fd)
-        self._check_integrity(questions_json, answers_json)
+import os
+import json
+import _pickle as cPickle
+import logging
 
-        self.question_ids = [q['question_id'] for q in questions_json['questions']]
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from transformers.tokenization import BertTokenizer
 
+from ._image_features_reader import ImageFeaturesH5Reader
+import pdb
+logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
-        # vocab
-        self.vocab = vocab_json
-        self.token_to_index = self.vocab['question']
-        self.answer_to_index = self.vocab['answer']
+def assert_eq(real, expected):
+    assert real == expected, "%s (true) vs %s (expected)" % (real, expected)
 
-        # q and a
-        self.questions = list(prepare_questions(questions_json))
-        self.answers = list(prepare_answers(answers_json))
-        self.questions = [self._encode_question(q) for q in self.questions]
-        self.answers = [self._encode_answers(a) for a in self.answers]
+def _create_entry(question, answer):
+    answer.pop("image_id")
+    answer.pop("question_id")
+    entry = {
+        "question_id": question["question_id"],
+        "image_id": question["image_id"],
+        "question": question["question"],
+        "answer": answer,
+    }
+    return entry
 
-        # v
-        self.image_features_path = image_features_path
-        self.coco_id_to_index = self._create_coco_id_to_index()
-        self.coco_ids = [q['image_id'] for q in questions_json['questions']]
+def _load_dataset(dataroot, name):
+    """Load entries
+    dataroot: root path of dataset
+    name: 'train', 'val', 'trainval', 'minsval'
+    """
+    if name == 'train' or name == 'val':
+        question_path = os.path.join(dataroot, "v2_OpenEnded_mscoco_%s2014_questions.json" % name)
+        questions = sorted(json.load(open(question_path))["questions"], key=lambda x: x["question_id"])
+        answer_path = os.path.join(dataroot, "cache", "%s_target.pkl" % name)
+        answers = cPickle.load(open(answer_path, "rb"))
+        answers = sorted(answers, key=lambda x: x["question_id"])
 
-        # only use questions that have at least one answer?
-        self.answerable_only = answerable_only
-        if self.answerable_only:
-            self.answerable = self._find_answerable()
+    elif name  == 'trainval':
+        question_path_train = os.path.join(dataroot, "v2_OpenEnded_mscoco_%s2014_questions.json" % 'train')
+        questions_train = sorted(json.load(open(question_path_train))["questions"], key=lambda x: x["question_id"])
+        answer_path_train = os.path.join(dataroot, "cache", "%s_target.pkl" % 'train')
+        answers_train = cPickle.load(open(answer_path_train, "rb"))
+        answers_train = sorted(answers_train, key=lambda x: x["question_id"])
 
-    @property
-    def max_question_length(self):
-        if not hasattr(self, '_max_length'):
-            self._max_length = max(map(len, self.questions))
-        return self._max_length
+        question_path_val = os.path.join(dataroot, "v2_OpenEnded_mscoco_%s2014_questions.json" % 'val')
+        questions_val = sorted(json.load(open(question_path_val))["questions"], key=lambda x: x["question_id"])
+        answer_path_val = os.path.join(dataroot, "cache", "%s_target.pkl" % 'val')
+        answers_val = cPickle.load(open(answer_path_val, "rb"))
+        answers_val = sorted(answers_val, key=lambda x: x["question_id"])
+        questions = questions_train + questions_val[:-3000]
+        answers = answers_train + answers_val[:-3000]
 
-    @property
-    def num_tokens(self):
-        return len(self.token_to_index) + 1  # add 1 for <unknown> token at index 0
+    elif name == 'minval':
+        question_path_val = os.path.join(dataroot, "v2_OpenEnded_mscoco_%s2014_questions.json" % 'val')
+        questions_val = sorted(json.load(open(question_path_val))["questions"], key=lambda x: x["question_id"])
+        answer_path_val = os.path.join(dataroot, "cache", "%s_target.pkl" % 'val')
+        answers_val = cPickle.load(open(answer_path_val, "rb"))
+        answers_val = sorted(answers_val, key=lambda x: x["question_id"])        
+        questions = questions_val[-3000:]
+        answers = answers_val[-3000:]
 
-    def _create_coco_id_to_index(self):
-        """ Create a mapping from a COCO image id into the corresponding index into the h5 file """
-        with h5py.File(self.image_features_path, 'r') as features_file:
-            coco_ids = features_file['ids'][()]
-        coco_id_to_index = {id: i for i, id in enumerate(coco_ids)}
-        return coco_id_to_index
+    elif name == 'test':
+        question_path_test = os.path.join(dataroot, "v2_OpenEnded_mscoco_%s2015_questions.json" % 'test')
+        questions_test = sorted(json.load(open(question_path_test))["questions"], key=lambda x: x["question_id"])
+        questions = questions_test
+    else:
+        assert False, "data split is not recognized."
 
-    def _check_integrity(self, questions, answers):
-        """ Verify that we are using the correct data """
-        qa_pairs = list(zip(questions['questions'], answers['annotations']))
-        assert all(q['question_id'] == a['question_id'] for q, a in qa_pairs), 'Questions not aligned with answers'
-        assert all(q['image_id'] == a['image_id'] for q, a in qa_pairs), 'Image id of question and answer don\'t match'
-        assert questions['data_type'] == answers['data_type'], 'Mismatched data types'
-        assert questions['data_subtype'] == answers['data_subtype'], 'Mismatched data subtypes'
+    if 'test' in name:
+        entries = []
+        for question in questions:
+            entries.append(question)
+    else:
+        assert_eq(len(questions), len(answers))
+        entries = []
+        for question, answer in zip(questions, answers):
+            assert_eq(question["question_id"], answer["question_id"])
+            assert_eq(question["image_id"], answer["image_id"])
+            entries.append(_create_entry(question, answer))
+    return entries
 
-    def _find_answerable(self):
-        """ Create a list of indices into questions that will have at least one answer that is in the vocab """
-        answerable = []
-        for i, answers in enumerate(self.answers):
-            answer_has_index = len(answers.nonzero()) > 0
-            # store the indices of anything that is answerable
-            if answer_has_index:
-                answerable.append(i)
-        return answerable
+class VQAClassificationDataset(Dataset):
+    def __init__(
+        self,
+        task: str,
+        dataroot: str,
+        annotations_jsonpath: str,
+        split: str,
+        image_features_reader: ImageFeaturesH5Reader,
+        gt_image_features_reader: ImageFeaturesH5Reader,
+        tokenizer: BertTokenizer,
+        padding_index: int = 0,
+        max_seq_length: int = 16,
+        max_region_num: int = 37,
+    ):
+        super().__init__()
+        self.split = split
+        ans2label_path = os.path.join(dataroot, "cache", "trainval_ans2label.pkl")
+        label2ans_path = os.path.join(dataroot, "cache", "trainval_label2ans.pkl")
+        self.ans2label = cPickle.load(open(ans2label_path, "rb"))
+        self.label2ans = cPickle.load(open(label2ans_path, "rb"))
+        self.num_labels = len(self.ans2label)
+        self._max_region_num = max_region_num
+        self._max_seq_length = max_seq_length
+        self._image_features_reader = image_features_reader
+        self._tokenizer = tokenizer
+        self._padding_index = padding_index
+        
+        if not os.path.exists(os.path.join(dataroot, "cache")):
+            os.makedirs(os.path.join(dataroot, "cache"))
 
-    def _encode_question(self, question):
-        """ Turn a question into a vector of indices and a question length """
-        vec = torch.zeros(self.max_question_length).long()
-        for i, token in enumerate(question):
-            index = self.token_to_index.get(token, 0)
-            vec[i] = index
-        return vec, len(question)
+        cache_path = os.path.join(dataroot, "cache", task + '_' + split + '_' + str(max_seq_length)+'.pkl')
+        if not os.path.exists(cache_path):
+            self.entries = _load_dataset(dataroot, split)
+            self.tokenize(max_seq_length)
+            self.tensorize()
+            cPickle.dump(self.entries, open(cache_path, 'wb'))
+        else:
+            logger.info("Loading from %s" %cache_path)
+            self.entries = cPickle.load(open(cache_path, "rb"))
 
-    def _encode_answers(self, answers):
-        """ Turn an answer into a vector """
-        # answer vec will be a vector of answer counts to determine which answers will contribute to the loss.
-        # this should be multiplied with 0.1 * negative log-likelihoods that a model produces and then summed up
-        # to get the loss that is weighted by how many humans gave that answer
-        answer_vec = torch.zeros(len(self.answer_to_index))
-        for answer in answers:
-            index = self.answer_to_index.get(answer)
-            if index is not None:
-                answer_vec[index] += 1
-        return answer_vec
+    def tokenize(self, max_length=16):
+        """Tokenizes the questions.
+        This will add q_token in each entry of the dataset.
+        -1 represent nil, and should be treated as padding_index in embedding
+        """
+        for entry in self.entries:
+            tokens = self._tokenizer.tokenize(entry["question"])
+            tokens = ["[CLS]"] + tokens + ["[SEP]"]
 
-    def _load_image(self, image_id):
-        """ Load an image """
-        if not hasattr(self, 'features_file'):
-            # Loading the h5 file has to be done here and not in __init__ because when the DataLoader
-            # forks for multiple works, every child would use the same file object and fail
-            # Having multiple readers using different file objects is fine though, so we just init in here.
-            self.features_file = h5py.File(self.image_features_path, 'r')
-        index = self.coco_id_to_index[image_id]
-        dataset = self.features_file['features']
-        img = dataset[index].astype('float32')
-        return torch.from_numpy(img)
+            tokens = [
+                self._tokenizer.vocab.get(w, self._tokenizer.vocab["[UNK]"])
+                for w in tokens
+            ]
+            
+            tokens = tokens[:max_length]
+            segment_ids = [0] * len(tokens)
+            input_mask = [1] * len(tokens)
 
-    def __getitem__(self, item):
-        if self.answerable_only:
-            # change of indices to only address answerable questions
-            item = self.answerable[item]
+            if len(tokens) < max_length:
+                # Note here we pad in front of the sentence
+                padding = [self._padding_index] * (max_length - len(tokens))
+                tokens = tokens + padding
+                input_mask += padding
+                segment_ids += padding
 
-        q, q_length = self.questions[item]
-        a = self.answers[item]
-        image_id = self.coco_ids[item]
-        v = self._load_image(image_id)
-        question_id = self.question_ids[item]
+            assert_eq(len(tokens), max_length)
+            entry["q_token"] = tokens
+            entry["q_input_mask"] = input_mask
+            entry["q_segment_ids"] = segment_ids
 
-        # since batches are re-ordered for PackedSequence's, the original question order is lost
-        # we return `item` so that the order of (v, q, a) triples can be restored if desired
-        # without shuffling in the dataloader, these will be in the order that they appear in the q and a json's.
-        return v, q, a, item, question_id, q_length
+    def tensorize(self):
+
+        for entry in self.entries:
+            question = torch.from_numpy(np.array(entry["q_token"]))
+            entry["q_token"] = question
+
+            q_input_mask = torch.from_numpy(np.array(entry["q_input_mask"]))
+            entry["q_input_mask"] = q_input_mask
+
+            q_segment_ids = torch.from_numpy(np.array(entry["q_segment_ids"]))
+            entry["q_segment_ids"] = q_segment_ids
+
+            if 'test' not in self.split:
+                answer = entry["answer"]
+                labels = np.array(answer["labels"])
+                scores = np.array(answer["scores"], dtype=np.float32)
+                if len(labels):
+                    labels = torch.from_numpy(labels)
+                    scores = torch.from_numpy(scores)
+                    entry["answer"]["labels"] = labels
+                    entry["answer"]["scores"] = scores
+                else:
+                    entry["answer"]["labels"] = None
+                    entry["answer"]["scores"] = None
+
+    def __getitem__(self, index):
+        entry = self.entries[index]
+        image_id = entry["image_id"]
+        question_id = entry["question_id"]
+        features, num_boxes, boxes, _ = self._image_features_reader[image_id]
+
+        mix_num_boxes = min(int(num_boxes), self._max_region_num)
+        mix_boxes_pad = np.zeros((self._max_region_num, 5))
+        mix_features_pad = np.zeros((self._max_region_num, 2048))
+
+        image_mask = [1] * (int(mix_num_boxes))
+        while len(image_mask) < self._max_region_num:
+            image_mask.append(0)
+
+        # shuffle the image location here.
+        # img_idx = list(np.random.permutation(num_boxes-1)[:mix_num_boxes]+1)
+        # img_idx.append(0)
+        # mix_boxes_pad[:mix_num_boxes] = boxes[img_idx]
+        # mix_features_pad[:mix_num_boxes] = features[img_idx]
+        
+        mix_boxes_pad[:mix_num_boxes] = boxes[:mix_num_boxes]
+        mix_features_pad[:mix_num_boxes] = features[:mix_num_boxes]
+
+        features = torch.tensor(mix_features_pad).float()
+        image_mask = torch.tensor(image_mask).long()
+        spatials = torch.tensor(mix_boxes_pad).float()
+
+        question = entry["q_token"]
+        input_mask = entry["q_input_mask"]
+        segment_ids = entry["q_segment_ids"]
+
+        co_attention_mask = torch.zeros((self._max_region_num, self._max_seq_length))
+        target = torch.zeros(self.num_labels)
+
+        if "test" not in self.split:
+            answer = entry["answer"]
+            labels = answer["labels"]
+            scores = answer["scores"]
+            if labels is not None:
+                target.scatter_(0, labels, scores)
+
+        return features, spatials, image_mask, question, target, input_mask, segment_ids, co_attention_mask, question_id
 
     def __len__(self):
-        if self.answerable_only:
-            return len(self.answerable)
-        else:
-            return len(self.questions)
+        return len(self.entries)
