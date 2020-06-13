@@ -137,9 +137,9 @@ class VQA_DETR(LightningModule):
         del state_dict
         #self.detr  = self.detr.cuda()
 
-        self.answer_to_index = self._mapping_ansto_index()
+        self.ans_to_index = self._mapping_ansto_index()
 
-        self.classifier  = nn.Linear(hidden_size*2,len(self.answer_to_index))
+        self.classifier  = nn.Linear(hidden_size*2,len(self.ans_to_index))
 
         self.drop_out = nn.Dropout(p=0.2)
         self.log_softmax = nn.LogSoftmax().cuda()
@@ -238,7 +238,7 @@ class VQA_DETR(LightningModule):
     def _mapping_ansto_index(self):
         # compile a list of all the answers
         entries = []
-        for name in ['tain', 'val']:
+        for name in ['train', 'val']:
             entries += utils._load_dataset(self.root,name)
         all_answers  = set()
         for a in entries:
@@ -276,7 +276,7 @@ class VQA(data.Dataset):
         self.split = split
         self.tokenizer = tokenizer
         self.max_len = max_len
-        self.entries = self._load_dataset( self.root, self.split)
+        self.entries = utils._load_dataset( self.root, self.split)
 
          # standard PyTorch mean-std input image normalization
         self.transform = T.Compose([
@@ -351,20 +351,21 @@ class VQA(data.Dataset):
         img = np.asarray(img)
         
         if len(img.shape)==2:
-            print(img.shape)
             img=np.expand_dims(img, axis=-1)
-            
             img = np.repeat(img,3, axis = -1)
-            print(img.shape)
-
         return img
 
     def __getitem__(self, item):
        
         entry  = self.entries[item]
         image_id = entry['image_id']
+        try:
+            img = self._load_image(image_id)
+        except:
+            entry = self.entries[0]
+            image_id = entry['image_id']
+            img = self._load_image(image_id)
 
-        img = self._load_image(image_id)
         q = entry['question']
         a = self._encode_answers(entry['answer'])
         img = Image.fromarray(img)
@@ -393,8 +394,6 @@ class VQA(data.Dataset):
         a = torch.stack(answers)
         
         return imgs, q, a
-
-    
 
 
 if __name__=="__main__":
