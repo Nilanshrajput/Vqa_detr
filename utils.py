@@ -1,133 +1,69 @@
-import os
+def assert_eq(real, expected):
+        assert real == expected, "%s (true) vs %s (expected)" % (real, expected)
 
-import torchvision.transforms as transforms
+def _create_entry(question, answer):
+    answer.pop("image_id")
+    answer.pop("question_id")
+    entry = {
+        "question_id": question["question_id"],
+        "image_id": question["image_id"],
+        "question": question["question"],
+        "answer": [a['answer'] for a in answer['answers']],
+    }
+    return entry
 
-import misc.config as config
+def _load_dataset(dataroot, name):
+    """Load entries
+    dataroot: root path of dataset
+    name: 'train', 'val', 'trainval', 'minsval'
+    """
+    if name == 'train' or name == 'val':
+        question_path = os.path.join(dataroot, "v2_OpenEnded_mscoco_%s2014_questions.json" % name)
+        questions = sorted(json.load(open(question_path))["questions"], key=lambda x: x["question_id"])
+        answer_path = os.path.join(dataroot, "v2_mscoco_%s2014_annotations.json" % name)
+        answers = json.load(open(answer_path, "rb"))["annotations"]
+        answers = sorted(answers, key=lambda x: x["question_id"])
 
+    elif name  == 'trainval':
+        question_path_train = os.path.join(dataroot, "v2_OpenEnded_mscoco_%s2014_questions.json" % 'train')
+        questions_train = sorted(json.load(open(question_path_train))["questions"], key=lambda x: x["question_id"])
+        answer_path_train = os.path.join(dataroot, "v2_mscoco_%s2014_annotations.json" % 'train')
+        answers_train = json.load(open(answer_path_train, "rb"))["annotations"]
+        answers_train = sorted(answers_train, key=lambda x: x["question_id"])
 
-def batch_accuracy(predicted, true):
-    """ Compute the accuracies for a batch of predictions and answers """
-    _, predicted_index = predicted.max(dim=1, keepdim=True)
-    agreeing = true.gather(dim=1, index=predicted_index)
-    '''
-    Acc needs to be averaged over all 10 choose 9 subsets of human answers.
-    While we could just use a loop, surely this can be done more efficiently (and indeed, it can).
-    There are two cases for the 1 chosen answer to be discarded:
-    (1) the discarded answer is not the predicted answer => acc stays the same
-    (2) the discarded answer is the predicted answer => we have to subtract 1 from the number of agreeing answers
-    
-    There are (10 - num_agreeing_answers) of case 1 and num_agreeing_answers of case 2, thus
-    acc = ((10 - agreeing) * min( agreeing      / 3, 1)
-           +     agreeing  * min((agreeing - 1) / 3, 1)) / 10
-    
-    Let's do some more simplification:
-    if num_agreeing_answers == 0:
-        acc = 0  since the case 1 min term becomes 0 and case 2 weighting term is 0
-    if num_agreeing_answers >= 4:
-        acc = 1  since the min term in both cases is always 1
-    The only cases left are for 1, 2, and 3 agreeing answers.
-    In all of those cases, (agreeing - 1) / 3  <  agreeing / 3  <=  1, so we can get rid of all the mins.
-    By moving num_agreeing_answers from both cases outside the sum we get:
-        acc = agreeing * ((10 - agreeing) + (agreeing - 1)) / 3 / 10
-    which we can simplify to:
-        acc = agreeing * 0.3
-    Finally, we can combine all cases together with:
-        min(agreeing * 0.3, 1)
-    '''
-    return (agreeing * 0.3).clamp(max=1)
+        question_path_val = os.path.join(dataroot, "v2_OpenEnded_mscoco_%s2014_questions.json" % 'val')
+        questions_val = sorted(json.load(open(question_path_val))["questions"], key=lambda x: x["question_id"])
+        answer_path_val = os.path.join(dataroot, "v2_mscoco_%s2014_annotations.json" % 'val')
+        answers_val = json.load(open(answer_path_val, "rb"))["annotations"]
+        answers_val = sorted(answers_val, key=lambda x: x["question_id"])
+        questions = questions_train + questions_val[:-3000]
+        answers = answers_train + answers_val[:-3000]
 
+    elif name == 'minval':
+        question_path_val = os.path.join(dataroot, "v2_OpenEnded_mscoco_%s2014_questions.json" % 'val')
+        questions_val = sorted(json.load(open(question_path_val))["questions"], key=lambda x: x["question_id"])
+        answer_path_val = os.path.join(dataroot, "v2_mscoco_%s2014_annotations.json" % 'val')
+        answers_val = json.load(open(answer_path_val, "rb"))["annotations"]
+        answers_val = sorted(answers_val, key=lambda x: x["question_id"])        
+        questions = questions_val[-3000:]
+        answers = answers_val[-3000:]
 
-def path_for(train=False, val=False, test=False, question=False, answer=False):
-    assert train + val + test == 1
-    assert question + answer == 1
-    assert not (test and answer), 'loading answers from test split not supported'  # if you want to eval on test, you need to implement loading of a VQA Dataset without given answers yourself
-    if train:
-        split = 'train2014'
-    elif val:
-        split = 'val2014'
+    elif name == 'test':
+        question_path_test = os.path.join(dataroot, "v2_OpenEnded_mscoco_%s2015_questions.json" % 'test')
+        questions_test = sorted(json.load(open(question_path_test))["questions"], key=lambda x: x["question_id"])
+        questions = questions_test
     else:
-        split = 'test2015'
-    if question:
-        fmt = '{0}_{1}_{2}_questions.json'
+        assert False, "data split is not recognized."
+
+    if 'test' in name:
+        entries = []
+        for question in questions:
+            entries.append(question)
     else:
-        fmt = '{1}_{2}_annotations.json'
-    s = fmt.format(config.task, config.dataset, split)
-    return os.path.join(config.qa_path, s)
-
-
-class Tracker:
-    """ Keep track of results over time, while having access to monitors to display information about them. """
-    def __init__(self):
-        self.data = {}
-
-    def track(self, name, *monitors):
-        """ Track a set of results with given monitors under some name (e.g. 'val_acc').
-            When appending to the returned list storage, use the monitors to retrieve useful information.
-        """
-        l = Tracker.ListStorage(monitors)
-        self.data.setdefault(name, []).append(l)
-        return l
-
-    def to_dict(self):
-        # turn list storages into regular lists
-        return {k: list(map(list, v)) for k, v in self.data.items()}
-
-
-    class ListStorage:
-        """ Storage of data points that updates the given monitors """
-        def __init__(self, monitors=[]):
-            self.data = []
-            self.monitors = monitors
-            for monitor in self.monitors:
-                setattr(self, monitor.name, monitor)
-
-        def append(self, item):
-            for monitor in self.monitors:
-                monitor.update(item)
-            self.data.append(item)
-
-        def __iter__(self):
-            return iter(self.data)
-
-    class MeanMonitor:
-        """ Take the mean over the given values """
-        name = 'mean'
-
-        def __init__(self):
-            self.n = 0
-            self.total = 0
-
-        def update(self, value):
-            self.total += value
-            self.n += 1
-
-        @property
-        def value(self):
-            return self.total / self.n
-
-    class MovingMeanMonitor:
-        """ Take an exponentially moving mean over the given values """
-        name = 'mean'
-
-        def __init__(self, momentum=0.9):
-            self.momentum = momentum
-            self.first = True
-            self.value = None
-
-        def update(self, value):
-            if self.first:
-                self.value = value
-                self.first = False
-            else:
-                m = self.momentum
-                self.value = m * self.value + (1 - m) * value
-
-
-def get_transform(target_size, central_fraction=1.0):
-    return transforms.Compose([
-        transforms.Scale(int(target_size / central_fraction)),
-        transforms.CenterCrop(target_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
-    ])
+        assert_eq(len(questions), len(answers))
+        entries = []
+        for question, answer in zip(questions, answers):
+            assert_eq(question["question_id"], answer["question_id"])
+            assert_eq(question["image_id"], answer["image_id"])
+            entries.append(_create_entry(question, answer))
+    return entries
