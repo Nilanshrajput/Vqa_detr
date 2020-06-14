@@ -24,7 +24,7 @@ from transformers import BertConfig, EncoderDecoderConfig, EncoderDecoderModel, 
 from transformers import AdamW
 from transformers import get_linear_schedule_with_warmup
 
-
+import pytorch_lightning as pl
 from pytorch_lightning.core.lightning import LightningModule
 from pytorch_lightning import Trainer
 
@@ -33,6 +33,13 @@ from sklearn.metrics import classification_report
 from sklearn.metrics import f1_score
 from typing import List, Dict
 import os
+
+import warnings
+warnings.filterwarnings("ignore")
+
+#Sees everything
+pl.trainer.seed_everything(seed=42)
+
 
 class DETRdemo(nn.Module):
     """
@@ -135,8 +142,7 @@ class VQA_DETR(LightningModule):
             map_location='cpu', check_hash=True)
         self.detr.load_state_dict(state_dict)
         del state_dict
-        #self.detr  = self.detr.cuda()
-
+        
         self.ans_to_index = self._mapping_ansto_index()
 
         self.classifier  = nn.Linear(hidden_size*2,len(self.ans_to_index))
@@ -207,7 +213,7 @@ class VQA_DETR(LightningModule):
         _, max_preds = preds.max(dim = -1) # get the index of the max 
         _, y = y.max(dim= -1)
         shape = max_preds.shape[0]
-        f1=f1_score(y.detach().view(shape).numpy(),max_preds.detach().view(shape).numpy(),average='macro')
+        f1=f1_score(y.cpu().view(shape).numpy(),max_preds.cpu().view(shape).numpy(),average='macro')
         f1  = torch.tensor(f1, dtype  = torch.float32)
         return f1
 
@@ -352,7 +358,7 @@ class VQA(data.Dataset):
         
         if len(img.shape)==2:
             img=np.expand_dims(img, axis=-1)
-            img = np.repeat(img,3, axis = -1)
+            img = np.repeat(img,3, axis = -1)   
         return img
 
     def __getitem__(self, item):
@@ -398,8 +404,8 @@ class VQA(data.Dataset):
 
 if __name__=="__main__":
     hparams = Namespace(
-        batch_size=1,
-        val_batch_size=1,
+        batch_size=3,
+        val_batch_size=3,
         num_warmup_steps=100,
         epochs=20,
         lr=3e-5,
@@ -408,6 +414,6 @@ if __name__=="__main__":
     )
 
     vqa_detr = VQA_DETR(hparams=hparams,root="/home/ubuntu/vqa/vqa_data")
-    #trainer = Trainer(gpus=4, max_epochs=20,log_gpu_memory=True)
-    trainer = Trainer(fast_dev_run=True)
+    trainer = Trainer(gpus=4, max_epochs=20,train_percent_check=.2,log_gpu_memory=True,weights_summary=None)
+    #trainer = Trainer(fast_dev_run=True)
     trainer.fit(vqa_detr)
